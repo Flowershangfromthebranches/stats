@@ -29,6 +29,7 @@ internal class SensorsReader: Reader<Sensors_List> {
     private var channels: CFMutableDictionary? = nil
     private var subscription: IOReportSubscriptionRef? = nil
     private var powers: (CPU: Double, GPU: Double, ANE: Double, RAM: Double, PCI: Double) = (0.0, 0.0, 0.0, 0.0, 0.0)
+    private var energyModelCPUFrozen: Bool = false
     
     init(callback: @escaping (T?) -> Void = {_ in }) {
         self.unknownSensorsState = Store.shared.bool(key: "Sensors_unknown", defaultValue: false)
@@ -565,6 +566,20 @@ extension SensorsReader {
         ]
     }
     
+    // SMC power rails that make up the CPU. Measured on a MacBook Air M3 (macOS 27.2) with
+    // background-QoS (E-cores only), default-QoS (P-cores) and Metal compute loads:
+    // PP0b follows the P-cluster, PPbb the E-cluster and PP7b the CPU SRAM; none of them move with the GPU.
+    private static let smcCPUPowerRails: [Platform: [String]] = [
+        .m3: ["PP0b", "PP7b", "PPbb"]
+    ]
+    
+    private static func smcCPUPower() -> Double? {
+        guard let platform = SystemKit.shared.device.platform, let keys = self.smcCPUPowerRails[platform] else { return nil }
+        let values = keys.compactMap({ SMC.shared.getValue($0) })
+        guard values.count == keys.count else { return nil }
+        return values.reduce(0, +)
+    }
+    
     private static func appleSiliconPower(currentEnergy: Double, previousEnergy: Double, elapsed: TimeInterval) -> Double {
         guard elapsed > 0 else { return 0 }
         return (currentEnergy - previousEnergy) / elapsed
@@ -615,8 +630,21 @@ extension SensorsReader {
         }
         let elapsed = now.timeIntervalSince(lastIOSensorsRead)
         defer { self.lastIOSensorsRead = now }
+        
+        // macOS 27 stopped updating the PMGR "Energy Model" counters (CPU Energy, ECPU, PCPU, ...)
+        // for processes without a private entitlement, so the CPU delta is always 0. They only jump
+        // when powerlog samples them, which would show up as a huge spike. Once the counter is seen
+        // frozen, switch to the SMC CPU rails for good.
+        var cpu = Self.appleSiliconPower(currentEnergy: self.powers.CPU, previousEnergy: prevCPU, elapsed: elapsed)
+        if cpu <= 0 {
+            self.energyModelCPUFrozen = true
+        }
+        if self.energyModelCPUFrozen, let smcCPU = Self.smcCPUPower() {
+            cpu = smcCPU
+        }
+        
         return (
-            Self.appleSiliconPower(currentEnergy: self.powers.CPU, previousEnergy: prevCPU, elapsed: elapsed),
+            cpu,
             Self.appleSiliconPower(currentEnergy: self.powers.GPU, previousEnergy: prevGPU, elapsed: elapsed),
             Self.appleSiliconPower(currentEnergy: self.powers.ANE, previousEnergy: prevANE, elapsed: elapsed),
             Self.appleSiliconPower(currentEnergy: self.powers.RAM, previousEnergy: prevRAM, elapsed: elapsed),
